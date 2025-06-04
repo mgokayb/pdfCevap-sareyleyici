@@ -1,0 +1,164 @@
+import os
+import fitz  # PyMuPDF
+
+MAX_QUESTIONS = 20
+
+def find_answer_for_question(words, question_str):
+    candidates_q = [w for w in words if w[4].strip() == question_str]
+    if not candidates_q:
+        return None
+
+    # En üstteki question hücresi (y0 en küçük) seçilir
+    q_cell = min(candidates_q, key=lambda w: w[1])  # w[1] = y0
+    qx, qy = q_cell[0], q_cell[1]
+
+    # Altındaki aday hücreleri: y>qy ve |x-qx|<5
+    lower_cells = []
+    for w in words:
+        text = w[4].strip()
+        if not text:
+            continue
+        x, y = w[0], w[1]
+        if y > qy + 1e-3 and abs(x - qx) < 5:
+            lower_cells.append((y, text))
+
+    if not lower_cells:
+        return None
+
+    # En küçük y (soru hücresine en yakın alt hücre)
+    lower_cells.sort(key=lambda item: item[0])
+    ans_text = lower_cells[0][1].strip().upper()
+    if not ans_text:
+        return None
+    return ans_text[0]  # İlk karakteri döndür
+
+def extract_all_answers_list(pdf_path):
+    """
+    PDF’in son sayfasındaki tüm soru numaraları ("1".."20") için
+    find_answer_for_question çağır, sonuçları [(1,'B'),...,(20,'C')] formatında döner.
+    """
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception as e:
+        print(f"  [!] PDF açılamadı: {e}")
+        return []
+
+    page = doc.load_page(doc.page_count - 1)
+    words = page.get_text("words")  # [[x0,y0,x1,y1,text], ...]
+    doc.close()
+
+    results = []
+    for qn in range(1, MAX_QUESTIONS + 1):
+        ans = find_answer_for_question(words, str(qn))
+        if ans is None:
+            ans = ""  # Bulamazsa boş string koy
+        results.append((qn, ans))
+    return results
+
+def annotate_pdf(pdf_path, answers_list, output_path):
+    """
+    1) pdf_path'ten PDF'i aç.
+    2) extract_all_answers_list ile alınan answers_list içindeki (qn, ans) çiftleri
+       için 0 .. page_count-2 sayfalarında arama yap:
+         - page.search_for(f"{qn}.")
+         - yoksa page.search_for(f"{qn})")
+         - yoksa page.search_for(f"{qn} -")
+       Bulursa ilk koordinata kırmızı ans metni ekle (x≈rect.x1+5, y≈rect.y0).
+       Bulamazsa terminale "* Soru {qn} bulunamadı → atlandı." yazar.
+    3) İşi bitince PDF'i output_path'a kaydeder.
+    """
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception as e:
+        print(f"  [!] '{pdf_path}' açılamadı: {e}")
+        return False
+
+    page_count = doc.page_count
+
+    for qn, ans in answers_list:
+        # Eğer ans boş string ise, zaten cevabı yok; atla
+        if not ans:
+            print(f"    * Soru {qn} için cevap boş → atlandı.")
+            continue
+
+        found = False
+        for pi in range(page_count - 1):  # son sayfa hariç
+            page = doc.load_page(pi)
+            # "qn.", "qn)" ve "qn -" kalıplarını sırayla dene
+            hits = page.search_for(f"{qn}.")
+            if not hits:
+                hits = page.search_for(f"{qn})")
+            if not hits:
+                hits = page.search_for(f"{qn} -")
+            if hits:
+                rect = hits[0]
+                x = rect.x1 + 5
+                y = rect.y0
+                # Kırmızı renkte, font size 12 ile yaz
+                page.insert_text((x, y), ans, fontsize=12, color=(1, 0, 0))
+                found = True
+                break
+
+        if not found:
+            print(f"    * Soru {qn} bulunamadı → atlandı.")
+
+    try:
+        # Yeni dosyayı kaydet
+        doc.save(output_path)
+    except Exception as e:
+        print(f"  [!] '{output_path}' kaydedilemedi: {e}")
+        doc.close()
+        return False
+
+    doc.close()
+    return True
+
+def main():
+    source_dir = "isaretlenecek pdfler"
+    dest_dir = "isaretlenmisler"
+
+    if not os.path.isdir(source_dir):
+        print(f"[!] '{source_dir}' adlı klasör bulunamadı.")
+        return
+    # İşaretlenmiş PDF’leri koyacağımız klasörü oluştur (varsa hata vermez)
+    os.makedirs(dest_dir, exist_ok=True)
+
+    # Klasördeki her PDF için işlemleri sırayla yap
+    for filename in sorted(os.listdir(source_dir)):
+        if not filename.lower().endswith(".pdf"):
+            continue
+
+        input_path = os.path.join(source_dir, filename)
+        print(f"\n➡️  İşleniyor: '{filename}'")
+
+        # 1) Son sayfadan cevap listesini al ([(1,'B'),(2,'C'),…])
+        answers_list = extract_all_answers_list(input_path)
+        if not answers_list:
+            print(f"  [!] '{filename}' için cevap anahtarı çıkarılamadı.")
+            continue
+
+        # 2) Her soru için (qn,ans) çiftlerini terminale çıktı al
+        print(f"    → Çıkarılan cevap listesi: {answers_list}")
+
+        # 3) PDF’i soru–cevap işaretiyle yeniden oluştur
+        output_path = os.path.join(dest_dir, filename)
+        ok = annotate_pdf(input_path, answers_list, output_path)
+
+        if ok:
+            # Başarılıysa orijinal dosyayı sil
+            try:
+                os.remove(input_path)
+                print(f"    ✔️ İşaretlendi ve taşındı → '{dest_dir}'. (Orijinal silindi)")
+            except Exception as e:
+                print(f"    ❗ Orijinal silinirken hata: {e}")
+        else:
+            # Başarısızsa, çıktı varsa kaldır
+            if os.path.exists(output_path):
+                try:
+                    os.remove(output_path)
+                except:
+                    pass
+            print(f" Atlandı: '{filename}' hâlâ '{source_dir}' klasöründe kalacak.")
+
+if __name__ == "__main__":
+    main()
